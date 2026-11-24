@@ -139,6 +139,56 @@ f.MaxPoints = 100
 f.UpdatePipeline()
 check("max points: output cleared", f.GetDataInformation().GetNumberOfPoints() == 0)
 
+# ------------------------------------------- point data, Uniform Per Cell
+f.MaxPoints = 5000000
+f.Concentration = ["POINTS", "px"]
+f.AmountPerPoint = 0.005
+f.PointDataPlacement = "Linear"
+_, _, fd_lin = fetch(f)
+f.PointDataPlacement = "Uniform Per Cell"
+o1, P1, fd_uni = fetch(f)
+check("uniform per cell: same total as linear",
+      np.isclose(fd_uni["TotalAmount_mmol"], fd_lin["TotalAmount_mmol"], rtol=1e-12))
+check("uniform per cell: value still interpolated", np.abs(arr(o1, "px") - 1000 * P1[:, 0]).max() < 1e-9)
+
+# Change the value at one node: only cells using that node may change, and
+# those only add or remove points.
+NODE = 3 * 7 + 3          # bottom-layer node at x = y = 0.5 (value 500)
+touching = {c for c in range(nc) if NODE in [ug.GetCell(c).GetPointId(k) for k in range(6)]}
+vals = 1000.0 * Pw[:, 0]
+vals[NODE] *= 3
+pa = ns.numpy_to_vtk(vals, deep=1)
+pa.SetName("px")
+ug.GetPointData().AddArray(pa)
+ug.Modified()
+src.MarkModified(src)
+o2, P2, _ = fetch(f)
+s1, s2 = arr(o1, "SourceCellId"), arr(o2, "SourceCellId")
+m1, m2 = ~np.isin(s1, list(touching)), ~np.isin(s2, list(touching))
+check("uniform per cell: untouched cells identical", np.array_equal(P1[m1], P2[m2]))
+nested = all({tuple(p) for p in P1[s1 == c]} <= {tuple(p) for p in P2[s2 == c]} or
+             {tuple(p) for p in P2[s2 == c]} <= {tuple(p) for p in P1[s1 == c]} for c in touching)
+check("uniform per cell: changed cells only add/remove", nested and (~m2).sum() > (~m1).sum(),
+      "%d -> %d points in changed cells" % ((~m1).sum(), (~m2).sum()))
+pa = ns.numpy_to_vtk(1000.0 * Pw[:, 0], deep=1)
+pa.SetName("px")
+ug.GetPointData().AddArray(pa)
+ug.Modified()
+src.MarkModified(src)
+
+# One quad with C = x + 0.5: Linear skews toward +x, Uniform Per Cell does not.
+one = Plane(XResolution=1, YResolution=1)
+c1q = Calculator(Input=one, ResultArrayName="C", Function="coordsX + 0.5")
+c1q.UpdatePipeline()
+f1 = MolarPointSampler(Input=c1q, Concentration=["POINTS", "C"], AmountPerPoint=0.0001)
+_, PL, _ = fetch(f1)
+f1.PointDataPlacement = "Uniform Per Cell"
+_, PU, _ = fetch(f1)
+check("one quad: linear follows field", abs(PL[:, 0].mean() - (2 / 3 - 0.5)) < 0.01,
+      "mean x %.4f" % PL[:, 0].mean())
+check("one quad: uniform per cell is uniform", abs(PU[:, 0].mean()) < 0.01,
+      "mean x %.4f, %d vs %d points" % (PU[:, 0].mean(), len(PU), len(PL)))
+
 # ------------------------------------------------------------- wavelet cases
 w = Wavelet()                                         # deliberately not updated first
 fw = MolarPointSampler(Input=w, AmountPerPoint=2550)

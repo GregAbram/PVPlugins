@@ -44,6 +44,16 @@ Cell Dimension    Auto (default): 3D cells if the input has any, otherwise
                   warning.  Volume: 3D cells only.  Surface: 2D cells only
                   (triangles, quads, polygons, strips).  1D and 0D cells are
                   never sampled.
+Point Data        Only for a point-data Concentration.  Linear (default):
+Placement         points follow the interpolated field inside each cell.
+                  Uniform Per Cell: each cell's amount is still computed
+                  exactly from the point data (same totals), but its points
+                  are spread uniformly in the cell, as for cell data.  Points
+                  then stay still between time steps -- see Method -- at the
+                  cost of detail inside cells, which only shows as density
+                  steps at cell faces when cells hold many points each.
+                  Refining the mesh (e.g. Tessellate) hides the steps and
+                  keeps the stability.
 Length Scale      Meters per mesh unit (1 for meters, 0.001 for mm), so that
                   volumes are in m^3 (areas in m^2).  Point counts scale with
                   its cube for volumes, its square for surfaces.
@@ -68,7 +78,8 @@ Output (vtkPolyData of vertices)
 Point data:
   <concentration>   the concentration at each point: the cell value, or the
                     linear interpolation of the point values (after clamping,
-                    see below).
+                    see below) -- interpolated even with Uniform Per Cell
+                    placement.
   other arrays      (Pass Arrays on) point arrays interpolated at the point
                     with the same barycentric weights that placed it --
                     floating-point arrays of any component count are
@@ -105,17 +116,21 @@ Method
     number of tets with a fractional count; e.g. 491-509 for a target of 500
     on the Wavelet source).
   * Cell data: points are uniform inside the tet (barycentric weights from a
-    Dirichlet(1,1,1,1) draw).  Point data: points follow the linear field
-    exactly -- pick a corner in proportion to its value, then a barycentric
-    point biased toward it (Dirichlet with that corner's parameter 2).  A
-    zero-valued corner draws no extra points.
+    Dirichlet(1,1,1,1) draw).  Point data, Linear placement: points follow
+    the linear field exactly -- pick a corner in proportion to its value,
+    then a barycentric point biased toward it (Dirichlet with that corner's
+    parameter 2).  A zero-valued corner draws no extra points.  Point data,
+    Uniform Per Cell: each input cell's exact amount is shared among its
+    tets by volume, and points are placed as for cell data.
   * All random numbers come from a counter-based hash of (seed, tet, point
     index), not from a stream.  In a time series on a fixed mesh, a cell
-    whose count does not change keeps exactly the same points (cell data),
-    and a cell gaining a point keeps its existing ones, so points appear or
-    vanish only where the material changes.  With point data, a point also
-    shifts slightly when its tet's corner values change.  If the mesh itself
-    changes between steps, the points are re-drawn.
+    whose count does not change keeps exactly the same points, and a cell
+    gaining a point keeps its existing ones, so points appear or vanish only
+    where the material changes.  This holds for cell data and for point data
+    with Uniform Per Cell placement.  With Linear placement, a point also
+    shifts when its tet's corner values change (and can jump toward another
+    corner).  If the mesh itself changes between steps, the points are
+    re-drawn.
 
 Element types and approximations
 --------------------------------
@@ -192,6 +207,113 @@ def _uniform(seed, tet, k, stream):
 _COUNT_STREAM = 7   # stream id for the rounding draw; 0-5 are used per point
 
 _DIM_AUTO, _DIM_VOLUME, _DIM_SURFACE = 0, 1, 2   # Cell Dimension property values
+_PLACE_LINEAR, _PLACE_CELL = 0, 1                 # Point Data Placement property values
+
+
+# --------------------------------------------------------------------------
+# Sampling core.  Module-level so other tools (AdvectionSampler.py) can import
+# this file and reuse exactly the same splitting, counting and placement.
+# --------------------------------------------------------------------------
+class Simplices(object):
+    """Result of simplicize(): the input split into tets or triangles.
+
+    tg           vtkUnstructuredGrid from vtkDataSetTriangleFilter (input point
+                 and cell data passed through; cell array SourceCellId added)
+    dim          3 (tets) or 2 (triangles)
+    sel          indices into tg of the simplices used
+    conn         (n, dim+1) point ids of each simplex
+    P            (npts, 3) float64 point coordinates
+    source_cell  (n,) input cell id of each simplex
+    warnings     messages for the caller to report
+    """
+
+
+def simplicize(ds, dimension=_DIM_AUTO):
+    """Split ds into simplices of one dimension.  dimension is _DIM_AUTO,
+    _DIM_VOLUME or _DIM_SURFACE (see the Cell Dimension property).  Raises
+    ValueError if there is nothing of that dimension to sample."""
+    tagged = ds.NewInstance()
+    tagged.ShallowCopy(ds)
+    src_ids = ns.numpy_to_vtk(np.arange(ds.GetNumberOfCells(), dtype=np.int64), deep=1)
+    src_ids.SetName("SourceCellId")
+    tagged.GetCellData().AddArray(src_ids)
+
+    # 3D cells -> tets, 2D cells -> triangles (lines/vertices are dropped below).
+    tri = vtkDataSetTriangleFilter()
+    tri.TetrahedraOnlyOff()
+    tri.SetInputData(tagged)
+    tri.Update()
+    tg = tri.GetOutput()
+
+    out = Simplices()
+    out.warnings = []
+    if tg.GetNumberOfCells() == 0:
+        raise ValueError("input has no 2D or 3D cells")
+    types = ns.vtk_to_numpy(tg.GetCellTypesArray())
+    n3 = int((types == VTK_TETRA).sum())
+    n2 = int((types == VTK_TRIANGLE).sum())
+    if dimension == _DIM_AUTO:
+        dim = 3 if n3 else 2
+        if n3 and n2:
+            out.warnings.append("input has both 3D and 2D cells; sampling the 3D cells only "
+                                "(set Cell Dimension to Surface to sample the 2D cells)")
+    else:
+        dim = 3 if dimension == _DIM_VOLUME else 2
+    if (n3 if dim == 3 else n2) == 0:
+        raise ValueError("input has no %s cells" % ("3D (volume)" if dim == 3 else "2D (surface)"))
+
+    s = dim + 1   # corners per simplex: 4 = tet, 3 = triangle
+    sel = np.nonzero(types == (VTK_TETRA if dim == 3 else VTK_TRIANGLE))[0]
+    offsets = ns.vtk_to_numpy(tg.GetCells().GetOffsetsArray())
+    out.conn = ns.vtk_to_numpy(tg.GetCells().GetConnectivityArray())[
+        offsets[sel][:, None] + np.arange(s)]
+    out.tg, out.dim, out.sel = tg, dim, sel
+    out.P = ns.vtk_to_numpy(tg.GetPoints().GetData()).astype(np.float64)
+    out.source_cell = ns.vtk_to_numpy(tg.GetCellData().GetArray("SourceCellId"))[sel]
+    return out
+
+
+def simplex_measure(P, conn, length_scale=1.0):
+    """Tet volumes (m^3) or triangle areas (m^2), from the number of corners."""
+    a, b, c = (P[conn[:, i]] for i in range(3))
+    if conn.shape[1] == 4:
+        vol = np.abs(np.einsum("ij,ij->i", np.cross(b - a, c - a), P[conn[:, 3]] - a)) / 6.0
+    else:
+        vol = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    return vol * length_scale ** (conn.shape[1] - 1)
+
+
+def stochastic_counts(amount, q, seed):
+    """Integer points per simplex: amount/q rounded down or up at random,
+    keyed by simplex index so the same seed gives the same rounding."""
+    ids = np.arange(len(amount), dtype=np.int64)
+    u = 1.0 - _uniform(seed, ids, np.zeros(len(amount), np.int64), _COUNT_STREAM)  # [0,1)
+    return np.floor(amount / q + u).astype(np.int64)
+
+
+def expand_counts(n):
+    """Per-simplex counts -> (simplex index, index within simplex) per point."""
+    tet = np.repeat(np.arange(len(n), dtype=np.int64), n)
+    k = np.arange(len(tet), dtype=np.int64) - np.repeat(np.cumsum(n) - n, n)
+    return tet, k
+
+
+def place_points(seed, P, conn, tet, k, corner_values=None):
+    """Positions of points (simplex tet[i], index k[i]) and their barycentric
+    weights.  corner_values None: uniform in the simplex.  Otherwise an
+    (N, s) array of the field at each point's simplex corners, and points
+    follow the linear field (corner chosen by value, then a Dirichlet draw
+    biased toward it)."""
+    N, s = len(tet), conn.shape[1]
+    # Barycentric weights: Dirichlet(1,...,1) is uniform in the simplex.
+    e = np.stack([-np.log(_uniform(seed, tet, k, st)) for st in range(s)], axis=1)
+    if corner_values is not None and N:
+        cum = np.cumsum(corner_values, axis=1)
+        r = (1.0 - _uniform(seed, tet, k, 4)) * cum[:, s - 1]
+        j = np.minimum((cum <= r[:, None]).sum(axis=1), s - 1)
+        e[np.arange(N), j] += -np.log(_uniform(seed, tet, k, 5))
+    w = e / e.sum(axis=1, keepdims=True)
+    return np.einsum("nk,nki->ni", w, P[conn[tet]]), w
 
 
 # Messages go to ParaView's Output Messages window (print() is easy to miss).
@@ -254,6 +376,7 @@ class MolarPointSampler(VTKPythonAlgorithmBase):
         self._max_points = 5000000
         self._pass_arrays = True
         self._dimension = _DIM_AUTO
+        self._placement = _PLACE_LINEAR
 
     # ---------------------------------------------------------------- props
     @smproperty.xml("""
@@ -299,6 +422,25 @@ class MolarPointSampler(VTKPythonAlgorithmBase):
     def SetCellDimension(self, d):
         if d != self._dimension:
             self._dimension = d
+            self.Modified()
+
+    @smproperty.intvector(name="PointDataPlacement", label="Point Data Placement",
+                          default_values=0)
+    @smdomain.xml("""
+        <EnumerationDomain name="enum">
+          <Entry value="0" text="Linear" />
+          <Entry value="1" text="Uniform Per Cell" />
+        </EnumerationDomain>
+        <Documentation>Only used when Concentration is a point array. Linear: points
+        follow the interpolated field inside each cell. Uniform Per Cell: each cell's
+        amount is computed exactly from the point data, but its points are spread
+        uniformly in the cell, as for cell data. Uniform Per Cell keeps points still
+        from one time step to the next (only adding or removing them), at the cost
+        of the detail inside each cell; best when cells hold few points each.
+        Totals are the same either way.</Documentation>""")
+    def SetPointDataPlacement(self, p):
+        if p != self._placement:
+            self._placement = p
             self.Modified()
 
     @smproperty.doublevector(name="LengthScale", label="Length Scale",
@@ -415,44 +557,15 @@ class MolarPointSampler(VTKPythonAlgorithmBase):
         if not on_points and assoc != vtkDataObject.FIELD_ASSOCIATION_CELLS:
             return _fail("concentration must be a point or cell array")
 
-        # Tag original cells, then tetrahedralize (cell and point data pass through).
-        tagged = inp.NewInstance()
-        tagged.ShallowCopy(inp)
-        src_ids = ns.numpy_to_vtk(np.arange(inp.GetNumberOfCells(), dtype=np.int64), deep=1)
-        src_ids.SetName("SourceCellId")
-        tagged.GetCellData().AddArray(src_ids)
-
-        # 3D cells -> tets, 2D cells -> triangles (lines/vertices are dropped below).
-        tri = vtkDataSetTriangleFilter()
-        tri.TetrahedraOnlyOff()
-        tri.SetInputData(tagged)
-        tri.Update()
-        tg = tri.GetOutput()
-
-        if tg.GetNumberOfCells() == 0:
-            return _fail("input has no 2D or 3D cells")
-        types = ns.vtk_to_numpy(tg.GetCellTypesArray())
-        n3 = int((types == VTK_TETRA).sum())
-        n2 = int((types == VTK_TRIANGLE).sum())
-        if self._dimension == _DIM_AUTO:
-            dim = 3 if n3 else 2
-            if n3 and n2:
-                _warn("input has both 3D and 2D cells; sampling the 3D cells only "
-                      "(set Cell Dimension to Surface to sample the 2D cells)")
-        else:
-            dim = 3 if self._dimension == _DIM_VOLUME else 2
-        if (n3 if dim == 3 else n2) == 0:
-            return _fail("input has no %s cells" % ("3D (volume)" if dim == 3 else "2D (surface)"))
-
-        # Simplices of the chosen dimension: s corners each (4 = tet, 3 = triangle).
+        try:
+            sx = simplicize(inp, self._dimension)
+        except ValueError as e:
+            return _fail(str(e))
+        for msg in sx.warnings:
+            _warn(msg)
+        tg, dim, sel, conn, P, source_cell = sx.tg, sx.dim, sx.sel, sx.conn, sx.P, sx.source_cell
         s = dim + 1
-        sel = np.nonzero(types == (VTK_TETRA if dim == 3 else VTK_TRIANGLE))[0]
-        offsets = ns.vtk_to_numpy(tg.GetCells().GetOffsetsArray())
-        conn = ns.vtk_to_numpy(tg.GetCells().GetConnectivityArray())[
-            offsets[sel][:, None] + np.arange(s)]
         ntet = len(sel)
-        P = ns.vtk_to_numpy(tg.GetPoints().GetData()).astype(np.float64)
-        source_cell = ns.vtk_to_numpy(tg.GetCellData().GetArray("SourceCellId"))[sel]
 
         attrs = tg.GetPointData() if on_points else tg.GetCellData()
         arr = attrs.GetArray(name)
@@ -463,46 +576,35 @@ class MolarPointSampler(VTKPythonAlgorithmBase):
             raw = raw[sel]
         conc = np.maximum(raw, 0.0)
 
-        # Simplex measure in SI units: tet volume in m^3, triangle area in m^2.
-        a, b, c = (P[conn[:, i]] for i in range(3))
-        if dim == 3:
-            vol = np.abs(np.einsum("ij,ij->i", np.cross(b - a, c - a), P[conn[:, 3]] - a)) / 6.0
-        else:
-            vol = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
-        vol *= self._length_scale ** dim
+        vol = simplex_measure(P, conn, self._length_scale)
 
         if on_points:
             cn = conc[conn]                       # (n simplices, s) corner values
             amount = vol * cn.mean(axis=1)
             clamped = (amount - vol * raw[conn].mean(axis=1)).sum()
+            if self._placement == _PLACE_CELL:
+                # Keep each input cell's exact amount, but spread it over the
+                # cell's simplices by size, i.e. uniform density within the cell.
+                cell_amount = np.bincount(source_cell, weights=amount)
+                cell_vol = np.bincount(source_cell, weights=vol)
+                share = np.divide(vol, cell_vol[source_cell],
+                                  out=np.zeros_like(vol), where=cell_vol[source_cell] > 0)
+                amount = cell_amount[source_cell] * share
         else:
             amount = vol * conc
             clamped = (amount - vol * raw).sum()
 
-        # Stochastic rounding of the expected count, keyed per tet.
-        tet_ids = np.arange(ntet, dtype=np.int64)
-        u = 1.0 - _uniform(self._seed, tet_ids, np.zeros(ntet, np.int64), _COUNT_STREAM)  # [0,1)
-        n = np.floor(amount / self._q + u).astype(np.int64)
+        n = stochastic_counts(amount, self._q, self._seed)
         N = int(n.sum())
         if N > self._max_points:
             return _fail("%d points exceeds Max Points (%d); "
                          "raise Amount Per Point to at least %.4g mmol"
                          % (N, self._max_points, amount.sum() / self._max_points))
 
-        tet = np.repeat(tet_ids, n)
-        k = np.arange(N, dtype=np.int64) - np.repeat(np.cumsum(n) - n, n)
-
-        # Barycentric weights: Dirichlet(1,...,1) is uniform in the simplex.
-        e = np.stack([-np.log(_uniform(self._seed, tet, k, st)) for st in range(s)], axis=1)
-        if on_points and N:
-            # Mixture over corners weighted by value -> density follows the linear field.
-            cp = cn[tet]
-            cum = np.cumsum(cp, axis=1)
-            r = (1.0 - _uniform(self._seed, tet, k, 4)) * cum[:, s - 1]
-            j = np.minimum((cum <= r[:, None]).sum(axis=1), s - 1)
-            e[np.arange(N), j] += -np.log(_uniform(self._seed, tet, k, 5))
-        w = e / e.sum(axis=1, keepdims=True)
-        pos = np.einsum("nk,nki->ni", w, P[conn[tet]])
+        tet, k = expand_counts(n)
+        cp = cn[tet] if on_points else None
+        linear = on_points and self._placement == _PLACE_LINEAR
+        pos, w = place_points(self._seed, P, conn, tet, k, cp if linear else None)
         value = (w * cp).sum(axis=1) if (on_points and N) else conc[tet]
 
         # Output: vertices with the sampled value and the source cell id.
